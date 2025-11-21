@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <title>Bake tile mask</title>
+  <style>html,body{margin:0;height:100%;background:#000}</style>
+
+  <script async src="https://unpkg.com/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.181.2/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.181.2/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script src="https://cdn.jsdelivr.net/gh/arscan/hexasphere.js@master/build/hexasphere.js"></script>
+</head>
+<body>
+<script type="module">
+  import * as THREE from "three";
+
+  const R = 10;
+  const subDivisions = 20;
+  const tileWidth = 0.96;
+  const hexasphere = new window.Hexasphere(R, subDivisions, tileWidth);
+
+  // 1) грузим карту в canvas
+  const img = new Image();
+  img.crossOrigin = "anonymous"; // если картинка с CDN
+  img.src = "./earth_texture.jpg"; // <-- твоя equirectangular-карта
+  await img.decode();
+
+  const cvs = document.createElement("canvas");
+  cvs.width = img.width;
+  cvs.height = img.height;
+  const ctx = cvs.getContext("2d");
+  ctx.drawImage(img, 0, 0);
+  const data = ctx.getImageData(0,0,cvs.width,cvs.height).data;
+
+  function samplePixel(u, v){
+    // u,v в [0..1]
+    const x = Math.min(cvs.width-1, Math.max(0, Math.floor(u * cvs.width)));
+    const y = Math.min(cvs.height-1, Math.max(0, Math.floor(v * cvs.height)));
+    const i = (y * cvs.width + x) * 4;
+    return [data[i], data[i+1], data[i+2], data[i+3]];
+  }
+
+  // простой детектор воды: пиксели, где синий заметно доминирует
+  function isWaterPixel(r,g,b){
+    return (b > r + 20) && (b > g + 20);
+  }
+
+  const waterTileIndices = [];
+  const mask01 = []; // если хочешь 0/1
+
+  hexasphere.tiles.forEach((t, idx) => {
+    const c = new THREE.Vector3(t.centerPoint.x, t.centerPoint.y, t.centerPoint.z);
+
+    // 2) 3D -> lat/lon
+    const lat = Math.asin(c.y / R);         // [-pi/2..pi/2]
+    const lon = Math.atan2(c.z, c.x);       // [-pi..pi]
+
+    // 3) lat/lon -> UV (equirectangular)
+    let u = (lon + Math.PI) / (2*Math.PI); 
+    let v = 1 - (lat + Math.PI/2) / Math.PI;
+
+    // wrap на всякий
+    u = (u % 1 + 1) % 1;
+    v = Math.min(1, Math.max(0, v));
+
+    // 4) sample
+    const [r,g,b] = samplePixel(u, v);
+    const water = isWaterPixel(r,g,b);
+
+    if (water) waterTileIndices.push(idx);
+    mask01.push(water ? 1 : 0);
+  });
+
+  // 5) скачать JSON
+  function downloadJSON(obj, name){
+    const blob = new Blob([JSON.stringify(obj)], {type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  console.log("tiles:", hexasphere.tiles.length);
+  console.log("water tiles:", waterTileIndices.length);
+
+  addEventListener("keydown", (e)=>{
+    if (e.key.toLowerCase() === "b"){
+      downloadJSON({
+        version: 1,
+        tileCount: hexasphere.tiles.length,
+        waterTiles: waterTileIndices, // или mask01
+        // mask01
+      }, "tileMask.json");
+    }
+  });
+
+  document.body.insertAdjacentHTML(
+    "beforeend",
+    `<div style="color:#fff;font:14px system-ui;padding:10px">
+       Loaded map ${img.width}×${img.height}. Press <b>B</b> to download tileMask.json
+     </div>`
+  );
+</script>
+</body>
+</html>

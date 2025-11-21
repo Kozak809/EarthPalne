@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Hex Earth from tileMask.json + White→White Colliding Arcs</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #c { width: 100%; height: 100%; display: block; }
+    .hint {
+      position: fixed; left: 12px; bottom: 12px; color: #bbb; font: 12px/1.4 system-ui, sans-serif;
+      background: rgba(0,0,0,.45); padding: 6px 8px; border-radius: 6px;
+      border: 1px solid rgba(255,255,255,.08);
+    }
+    .warn {
+      position: fixed; right: 12px; top: 12px; color: #ffb;
+      font: 12px/1.4 system-ui, sans-serif; background: rgba(0,0,0,.6);
+      padding: 6px 8px; border-radius: 6px; display:none;
+    }
+  </style>
+
+  <script async src="https://unpkg.com/es-module-shims@1.10.0/dist/es-module-shims.js"></script>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.181.2/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.181.2/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script src="https://cdn.jsdelivr.net/gh/arscan/hexasphere.js@master/build/hexasphere.js"></script>
+</head>
+
+<body>
+  <canvas id="c"></canvas>
+  <div class="hint">Drag • Scroll • Gray = reservoirs (waterTiles) • White = earth • Arcs only White→White</div>
+  <div id="warn" class="warn"></div>
+
+<script type="module">
+  import * as THREE from "three";
+  import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+  const warnEl = document.getElementById("warn");
+  function warn(msg){
+    warnEl.textContent = msg;
+    warnEl.style.display = "block";
+  }
+
+  // ---------- Scene ----------
+  const canvas = document.getElementById("c");
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 200);
+  camera.position.set(0, 0, 28);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+  dir.position.set(10, 15, 18);
+  scene.add(dir);
+
+  // ---------- Load tile mask ----------
+  let waterSet = new Set();
+  try {
+    const mask = await (await fetch("./tileMask.json")).json();
+    if (!mask || !Array.isArray(mask.waterTiles)) {
+      warn("tileMask.json есть, но нет waterTiles:number[]");
+    } else {
+      waterSet = new Set(mask.waterTiles);
+      console.log("Loaded tileMask.json. water tiles:", waterSet.size);
+      if (mask.tileCount != null) console.log("Mask tileCount:", mask.tileCount);
+    }
+  } catch (e) {
+    warn("Не смог загрузить tileMask.json. Проверь путь и сервер.");
+    console.warn(e);
+  }
+
+  // ---------- Hex globe ----------
+  const R = 10;
+  const subDivisions = 25;   // tileMask.json должен быть запечён под это число
+  const tileWidth = 0.96;
+  const hexasphere = new window.Hexasphere(R, subDivisions, tileWidth);
+
+  if (waterSet.size && waterSet.size > hexasphere.tiles.length) {
+    warn("tileMask.json запечён под другое subDivisions — перезапеки под 25.");
+  }
+
+  const landMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff, roughness: 0.9, metalness: 0.0, flatShading: true
+  });
+  const waterMat = new THREE.MeshStandardMaterial({
+    color: 0x808080, roughness: 1.0, metalness: 0.0, flatShading: true
+  });
+
+  const tiles = [];
+  const tileGroup = new THREE.Group();
+  scene.add(tileGroup);
+
+  const surfaceScale = R * 1.01;
+
+  // build tiles
+  for (let i = 0; i < hexasphere.tiles.length; i++) {
+    const t = hexasphere.tiles[i];
+
+    const center = new THREE.Vector3(t.centerPoint.x, t.centerPoint.y, t.centerPoint.z);
+    const surfaceCenter = center.clone().normalize().multiplyScalar(surfaceScale);
+
+    const boundary = t.boundary.map(p => new THREE.Vector3(p.x, p.y, p.z));
+    const positions = [];
+    for (let k = 0; k < boundary.length; k++) {
+      const v1 = boundary[k];
+      const v2 = boundary[(k + 1) % boundary.length];
+      positions.push(
+        center.x, center.y, center.z,
+        v1.x, v1.y, v1.z,
+        v2.x, v2.y, v2.z
+      );
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geom.computeVertexNormals();
+
+    const isReservoir = waterSet.has(i);
+    const mesh = new THREE.Mesh(geom, isReservoir ? waterMat : landMat);
+    tileGroup.add(mesh);
+
+    tiles.push({ center, surfaceCenter, isReservoir, mesh });
+  }
+
+  tileGroup.rotation.z = THREE.MathUtils.degToRad(23.5);
+
+  // ---------- Precompute land (white) indices ----------
+  const landIndices = [];
+  for (let i = 0; i < tiles.length; i++) {
+    if (!tiles[i].isReservoir) landIndices.push(i);
+  }
+  if (landIndices.length < 2) {
+    warn("Слишком мало белых плиток (land) для дуг.");
+  }
+
+  // ---------- Collision radius (auto) ----------
+  let minD = Infinity;
+  const sampleCount = Math.min(250, tiles.length);
+  for (let s = 0; s < sampleCount; s++) {
+    const a = tiles[(Math.random() * tiles.length) | 0].surfaceCenter;
+    for (let j = 0; j < 12; j++) {
+      const b = tiles[(Math.random() * tiles.length) | 0].surfaceCenter;
+      const d = a.distanceTo(b);
+      if (d > 1e-6 && d < minD) minD = d;
+    }
+  }
+  const collisionRadius = (isFinite(minD) ? minD : R * 0.2) * 0.55;
+  const collisionRadiusSq = collisionRadius * collisionRadius;
+
+  // ---------- Arcs ----------
+  const arcs = [];
+  const arcColor = 0x66aaff;
+
+  function addRandomArc() {
+    if (landIndices.length < 2) return;
+
+    let startIdx = landIndices[(Math.random() * landIndices.length) | 0];
+    let endIdx   = landIndices[(Math.random() * landIndices.length) | 0];
+    while (endIdx === startIdx) {
+      endIdx = landIndices[(Math.random() * landIndices.length) | 0];
+    }
+
+    const a = tiles[startIdx];
+    const b = tiles[endIdx];
+
+    const start = a.surfaceCenter.clone();
+    const end   = b.surfaceCenter.clone();
+    const mid = start.clone().add(end).normalize().multiplyScalar(R * 1.5);
+
+    const curve = new THREE.CatmullRomCurve3([start, mid, end]);
+    const points = curve.getPoints(90);
+
+    const geom = new THREE.BufferGeometry().setFromPoints(points);
+    geom.setDrawRange(0, 0);
+
+    const mat = new THREE.LineBasicMaterial({
+      color: arcColor,
+      transparent: true,
+      opacity: 1.0
+    });
+
+    const line = new THREE.Line(geom, mat);
+    tileGroup.add(line); // вращается с Землёй
+
+    arcs.push({
+      line, geom, mat,
+      points,
+      pointsCount: points.length,
+      t: 0,
+      duration: 1.6,
+      fade: 1.0,
+      stopped: false,
+      startIdx
+    });
+  }
+
+  addRandomArc();
+  setInterval(addRandomArc, 150);
+
+  // ---------- Animate ----------
+  const clock = new THREE.Clock();
+  function tick() {
+    requestAnimationFrame(tick);
+    const dt = clock.getDelta();
+
+    controls.update();
+    tileGroup.rotation.y += dt * 0.12;
+
+    for (let i = arcs.length - 1; i >= 0; i--) {
+      const a = arcs[i];
+      a.t += dt;
+
+      if (!a.stopped) {
+        const drawP = Math.min(a.t / a.duration, 1);
+        const drawn = Math.max(1, Math.floor(drawP * a.pointsCount));
+        a.geom.setDrawRange(0, drawn);
+
+        const head = a.points[drawn - 1];
+
+        // collision with any tile except start
+        for (let k = 0; k < tiles.length; k++) {
+          if (k === a.startIdx) continue;
+          const c = tiles[k].surfaceCenter;
+          if (head.distanceToSquared(c) <= collisionRadiusSq) {
+            a.stopped = true;
+            a.geom.setDrawRange(0, drawn);
+            a.t = a.duration; // начинаем фейд
+            break;
+          }
+        }
+
+        // if finished without collision -> fade
+        if (!a.stopped && a.t > a.duration) {
+          const fadeT = a.t - a.duration;
+          a.mat.opacity = Math.max(1 - fadeT / a.fade, 0);
+          if (fadeT >= a.fade) {
+            tileGroup.remove(a.line);
+            a.geom.dispose();
+            a.mat.dispose();
+            arcs.splice(i, 1);
+          }
+        }
+
+      } else {
+        const fadeT = a.t - a.duration;
+        a.mat.opacity = Math.max(1 - fadeT / a.fade, 0);
+        if (fadeT >= a.fade) {
+          tileGroup.remove(a.line);
+          a.geom.dispose();
+          a.mat.dispose();
+          arcs.splice(i, 1);
+        }
+      }
+    }
+
+    renderer.render(scene, camera);
+  }
+  tick();
+
+  addEventListener("resize", () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+</script>
+</body>
+</html>
